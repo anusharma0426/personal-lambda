@@ -1,0 +1,26 @@
+# Local assumed-role credentials
+.env.assume
+**/.env.assume
+
+# Generated Terraform artifacts
+terraform-aws/.terraform-plan-*
+terraform-aws/errored.tfstate
+terraform-state-*.html.terraform/**
+.terraform.lock.hcl
+.terraform-plan*
+errored.tfstate
+
+# Lambda build artefacts — directory is tracked via .gitkeep, zip is generated at plan time
+**/.build/*.zip
+
+# State reports and HTML outputs
+terraform-aws/.state-reports/
+terraform-state-*.html
+
+.env.assume
+docker-local/*
+
+aws_sso_login.sh
+.vscode/settings.json
+tf_local.sh
+tf_local_setup.sh
