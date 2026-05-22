@@ -1,0 +1,145 @@
+name: Deploy Infrastructure
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+    tags:
+      - 'b*'
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      target_environment:
+        description: Highest environment to deploy.
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - sit
+          - uat
+          - prd
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  secret-detection:
+    name: Secret Detection
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install docker-compose compatibility wrapper
+        shell: bash
+        run: |
+          if ! command -v docker-compose >/dev/null 2>&1; then
+            sudo tee /usr/local/bin/docker-compose >/dev/null <<'EOF'
+            #!/usr/bin/env bash
+            docker compose "$@"
+            EOF
+            sudo chmod +x /usr/local/bin/docker-compose
+          fi
+          docker-compose version
+
+      - name: Log in to GitLab container registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.cochlear.dev
+          username: ${{ secrets.GITLAB_REGISTRY_USERNAME }}
+          password: ${{ secrets.GITLAB_REGISTRY_TOKEN }}
+
+      - name: Run gitleaks scan
+        shell: bash
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            registry.cochlear.dev/devops/gitlab-ci-build-image:gitleaks-v8.30.0 \
+            detect --source="/work" --no-git -v
+
+  deploy-dev:
+    name: Deploy Dev
+    if: ${{ github.event_name != 'pull_request' }}
+    needs: secret-detection
+    uses: ./.github/workflows/terraform-deploy.yml
+    with:
+      environment: dev
+      aws_region: eu-west-1
+      workspace: eu-west-1-dev
+      auto_apply: true
+    secrets:
+      AWS_BOOTSTRAP_ROLE_ARN: ${{ secrets.DEV_AWS_BOOTSTRAP_ROLE_ARN }}
+      AWS_ACCOUNT_ID: ${{ secrets.DEV_AWS_ACCOUNT_ID }}
+      AWS_ROLE: ${{ secrets.DEV_AWS_ROLE }}
+      AWS_ECR_ACCOUNT_ID: ${{ secrets.DEV_AWS_ECR_ACCOUNT_ID }}
+      AWS_ECR_REPO: ${{ secrets.DEV_AWS_ECR_REPO }}
+      GITLAB_REGISTRY_USERNAME: ${{ secrets.GITLAB_REGISTRY_USERNAME }}
+      GITLAB_REGISTRY_TOKEN: ${{ secrets.GITLAB_REGISTRY_TOKEN }}
+
+  deploy-sit:
+    name: Deploy Sit
+    if: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.target_environment != 'dev') }}
+    needs: deploy-dev
+    uses: ./.github/workflows/terraform-deploy.yml
+    with:
+      environment: sit
+      aws_region: eu-west-1
+      workspace: eu-west-1-sit
+      auto_apply: true
+    secrets:
+      AWS_BOOTSTRAP_ROLE_ARN: ${{ secrets.SIT_AWS_BOOTSTRAP_ROLE_ARN }}
+      AWS_ACCOUNT_ID: ${{ secrets.SIT_AWS_ACCOUNT_ID }}
+      AWS_ROLE: ${{ secrets.SIT_AWS_ROLE }}
+      AWS_ECR_ACCOUNT_ID: ${{ secrets.SIT_AWS_ECR_ACCOUNT_ID }}
+      AWS_ECR_REPO: ${{ secrets.SIT_AWS_ECR_REPO }}
+      GITLAB_REGISTRY_USERNAME: ${{ secrets.GITLAB_REGISTRY_USERNAME }}
+      GITLAB_REGISTRY_TOKEN: ${{ secrets.GITLAB_REGISTRY_TOKEN }}
+
+  deploy-uat:
+    name: Deploy Uat
+    if: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.target_environment == 'uat' || inputs.target_environment == 'prd') }}
+    needs: deploy-sit
+    uses: ./.github/workflows/terraform-deploy.yml
+    with:
+      environment: uat
+      aws_region: eu-west-1
+      workspace: eu-west-1-uat
+      auto_apply: true
+    secrets:
+      AWS_BOOTSTRAP_ROLE_ARN: ${{ secrets.UAT_AWS_BOOTSTRAP_ROLE_ARN }}
+      AWS_ACCOUNT_ID: ${{ secrets.UAT_AWS_ACCOUNT_ID }}
+      AWS_ROLE: ${{ secrets.UAT_AWS_ROLE }}
+      AWS_ECR_ACCOUNT_ID: ${{ secrets.UAT_AWS_ECR_ACCOUNT_ID }}
+      AWS_ECR_REPO: ${{ secrets.UAT_AWS_ECR_REPO }}
+      GITLAB_REGISTRY_USERNAME: ${{ secrets.GITLAB_REGISTRY_USERNAME }}
+      GITLAB_REGISTRY_TOKEN: ${{ secrets.GITLAB_REGISTRY_TOKEN }}
+
+  deploy-prd:
+    name: Deploy Prd
+    if: ${{ github.event_name != 'pull_request' && ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.target_environment == 'prd')) }}
+    needs: deploy-uat
+    uses: ./.github/workflows/terraform-deploy.yml
+    with:
+      environment: prd
+      aws_region: eu-west-1
+      workspace: eu-west-1-prd
+      auto_apply: true
+    secrets:
+      AWS_BOOTSTRAP_ROLE_ARN: ${{ secrets.PRD_AWS_BOOTSTRAP_ROLE_ARN }}
+      AWS_ACCOUNT_ID: ${{ secrets.PRD_AWS_ACCOUNT_ID }}
+      AWS_ROLE: ${{ secrets.PRD_AWS_ROLE }}
+      AWS_ECR_ACCOUNT_ID: ${{ secrets.PRD_AWS_ECR_ACCOUNT_ID }}
+      AWS_ECR_REPO: ${{ secrets.PRD_AWS_ECR_REPO }}
+      GITLAB_REGISTRY_USERNAME: ${{ secrets.GITLAB_REGISTRY_USERNAME }}
+      GITLAB_REGISTRY_TOKEN: ${{ secrets.GITLAB_REGISTRY_TOKEN }}

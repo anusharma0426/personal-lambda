@@ -1,0 +1,206 @@
+name: Terraform Deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: Deployment stage and GitHub environment name.
+        required: true
+        type: string
+      aws_region:
+        description: AWS region for this workspace.
+        required: true
+        type: string
+      workspace:
+        description: Terraform workspace to select.
+        required: true
+        type: string
+      auto_apply:
+        description: Run the apply job after plan.
+        required: false
+        default: true
+        type: boolean
+    secrets:
+      AWS_BOOTSTRAP_ROLE_ARN:
+        required: true
+      AWS_ACCOUNT_ID:
+        required: true
+      AWS_ROLE:
+        required: true
+      AWS_ECR_ACCOUNT_ID:
+        required: true
+      AWS_ECR_REPO:
+        required: true
+      GITLAB_REGISTRY_USERNAME:
+        required: true
+      GITLAB_REGISTRY_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: terraform-${{ inputs.workspace }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare Metadata
+    runs-on: ubuntu-latest
+    outputs:
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+      ref_slug: ${{ steps.meta.outputs.ref_slug }}
+      ecr_tag: ${{ steps.meta.outputs.ecr_tag }}
+    steps:
+      - name: Derive GitLab-compatible metadata
+        id: meta
+        shell: bash
+        run: |
+          short_sha="${GITHUB_SHA::8}"
+          ref_name="${GITHUB_REF_NAME}"
+          ref_slug="$(echo "${ref_name}" | tr '[:upper:]' '[:lower:]' | sed -E 's#[^a-z0-9]+#-#g; s#(^-|-$)##g')"
+
+          if [[ -z "${ref_slug}" ]]; then
+            ref_slug="detached-head"
+          fi
+
+          echo "short_sha=${short_sha}" >> "${GITHUB_OUTPUT}"
+          echo "ref_slug=${ref_slug}" >> "${GITHUB_OUTPUT}"
+          echo "ecr_tag=${short_sha}-${ref_slug}" >> "${GITHUB_OUTPUT}"
+
+  plan:
+    name: Plan ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    needs: prepare
+    timeout-minutes: 60
+    env:
+      ENV: ${{ inputs.environment }}
+      AWS_REGION: ${{ inputs.aws_region }}
+      WORKSPACE: ${{ inputs.workspace }}
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+      AWS_ROLE: ${{ secrets.AWS_ROLE }}
+      AWS_ECR_ACCOUNT_ID: ${{ secrets.AWS_ECR_ACCOUNT_ID }}
+      AWS_ECR_REPO: ${{ secrets.AWS_ECR_REPO }}
+      AWS_ECR_URL: ${{ secrets.AWS_ECR_ACCOUNT_ID }}.dkr.ecr.${{ inputs.aws_region }}.amazonaws.com
+      CI_REGISTRY: registry.cochlear.dev
+      CI_JOB_TOKEN: ${{ secrets.GITLAB_REGISTRY_TOKEN }}
+      GITLAB_TOKEN_READONLY: ${{ secrets.GITLAB_REGISTRY_TOKEN }}
+      CI_COMMIT_SHORT_SHA: ${{ needs.prepare.outputs.short_sha }}
+      ECR_TAG: ${{ needs.prepare.outputs.ecr_tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS bootstrap credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_BOOTSTRAP_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Install docker-compose compatibility wrapper
+        shell: bash
+        run: |
+          if ! command -v docker-compose >/dev/null 2>&1; then
+            sudo tee /usr/local/bin/docker-compose >/dev/null <<'EOF'
+            #!/usr/bin/env bash
+            docker compose "$@"
+            EOF
+            sudo chmod +x /usr/local/bin/docker-compose
+          fi
+          docker-compose version
+
+      - name: Log in to GitLab container registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.cochlear.dev
+          username: ${{ secrets.GITLAB_REGISTRY_USERNAME }}
+          password: ${{ secrets.GITLAB_REGISTRY_TOKEN }}
+
+      - name: Prepare workspace mounts
+        shell: bash
+        run: mkdir -p .ssh
+
+      - name: Terraform init
+        run: make init
+
+      - name: Terraform plan
+        run: make plan
+
+      - name: Upload Terraform plan and Lambda artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-${{ inputs.workspace }}
+          path: |
+            terraform-aws/.terraform-plan-*
+            terraform-aws/modules/**/.build/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  apply:
+    name: Apply ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    needs:
+      - prepare
+      - plan
+    if: ${{ inputs.auto_apply }}
+    timeout-minutes: 60
+    environment: ${{ inputs.environment }}
+    env:
+      ENV: ${{ inputs.environment }}
+      AWS_REGION: ${{ inputs.aws_region }}
+      WORKSPACE: ${{ inputs.workspace }}
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+      AWS_ROLE: ${{ secrets.AWS_ROLE }}
+      AWS_ECR_ACCOUNT_ID: ${{ secrets.AWS_ECR_ACCOUNT_ID }}
+      AWS_ECR_REPO: ${{ secrets.AWS_ECR_REPO }}
+      AWS_ECR_URL: ${{ secrets.AWS_ECR_ACCOUNT_ID }}.dkr.ecr.${{ inputs.aws_region }}.amazonaws.com
+      CI_REGISTRY: registry.cochlear.dev
+      CI_JOB_TOKEN: ${{ secrets.GITLAB_REGISTRY_TOKEN }}
+      GITLAB_TOKEN_READONLY: ${{ secrets.GITLAB_REGISTRY_TOKEN }}
+      CI_COMMIT_SHORT_SHA: ${{ needs.prepare.outputs.short_sha }}
+      ECR_TAG: ${{ needs.prepare.outputs.ecr_tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS bootstrap credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_BOOTSTRAP_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Install docker-compose compatibility wrapper
+        shell: bash
+        run: |
+          if ! command -v docker-compose >/dev/null 2>&1; then
+            sudo tee /usr/local/bin/docker-compose >/dev/null <<'EOF'
+            #!/usr/bin/env bash
+            docker compose "$@"
+            EOF
+            sudo chmod +x /usr/local/bin/docker-compose
+          fi
+          docker-compose version
+
+      - name: Log in to GitLab container registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.cochlear.dev
+          username: ${{ secrets.GITLAB_REGISTRY_USERNAME }}
+          password: ${{ secrets.GITLAB_REGISTRY_TOKEN }}
+
+      - name: Restore Terraform plan and Lambda artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-${{ inputs.workspace }}
+          path: .
+
+      - name: Prepare workspace mounts
+        shell: bash
+        run: mkdir -p .ssh
+
+      - name: Terraform init
+        run: make init
+
+      - name: Terraform apply
+        run: make apply
